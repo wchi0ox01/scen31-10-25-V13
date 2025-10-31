@@ -330,6 +330,12 @@
         let registeredStudentId = null;
         let registeredStudentName = null;
         let registeredStudentClass = null;
+        let hasCheckedInToday = false;
+        
+        // เพิ่มตัวแปรสำหรับ Face Recognition
+        let faceMatcher = null;
+        let students = [];
+        let recognitionInProgress = false;
 
         const video = document.getElementById('video');
         const scanButton = document.getElementById('scanButton');
@@ -362,6 +368,13 @@
             // โหลดโมเดลใบหน้า
             await loadFaceApiModels();
             modelsLoaded = true;
+            
+            // โหลดข้อมูลนักเรียนสำหรับ Face Recognition
+            loadingDetail.textContent = 'กำลังโหลดข้อมูลการจดจำใบหน้า...';
+            await loadStudentDataForRecognition();
+            
+            // ตรวจสอบว่ามีการเช็คชื่อวันนี้แล้วหรือไม่
+            await checkTodayAttendance();
             
             // อัพเดทข้อความ loading
             loadingDetail.textContent = 'กำลังเริ่มต้นกล้อง...';
@@ -417,6 +430,78 @@
             } catch (error) {
                 console.error('Error loading face models:', error);
                 showAlert('ไม่สามารถโหลดโมเดลใบหน้าได้ กรุณารีเฟรชหน้าเว็บ', 'error');
+            }
+        }
+
+        // เพิ่มฟังก์ชันโหลดข้อมูลนักเรียนสำหรับ Face Recognition
+        async function loadStudentDataForRecognition() {
+            try {
+                const response = await apiCall({ action: 'getStudents' });
+                if (response.success && response.data.length > 0) {
+                    students = response.data;
+                    const labeledFaceDescriptors = await Promise.all(students.map(async (student) => {
+                        if (student.imagedatabase64 && student.imagedatabase64.startsWith('data:image')) {
+                            try {
+                                const img = await faceapi.fetchImage(student.imagedatabase64);
+                                const detections = await faceapi.detectSingleFace(img)
+                                    .withFaceLandmarks()
+                                    .withFaceDescriptor();
+                                if (detections) {
+                                    return new faceapi.LabeledFaceDescriptors(student.name, [detections.descriptor]);
+                                }
+                            } catch (e) {
+                                console.error(`Could not process image for ${student.name}`, e);
+                            }
+                        }
+                        return null;
+                    }));
+                    
+                    const validDescriptors = labeledFaceDescriptors.filter(Boolean);
+                    if (validDescriptors.length > 0) {
+                        faceMatcher = new faceapi.FaceMatcher(validDescriptors, 0.6);
+                        console.log('Face matcher ready with', validDescriptors.length, 'students');
+                    } else {
+                        faceMatcher = null;
+                        console.log('No valid face descriptors found');
+                    }
+                } else {
+                    faceMatcher = null;
+                    console.log('No student data found for recognition');
+                }
+            } catch (error) {
+                console.error('Error loading student data for recognition:', error);
+                faceMatcher = null;
+            }
+        }
+
+        // ฟังก์ชันตรวจสอบว่ามีการเช็คชื่อวันนี้แล้วหรือไม่
+        async function checkTodayAttendance() {
+            try {
+                const today = new Date().toDateString();
+                const savedAttendance = localStorage.getItem(`attendance_${today}`);
+                
+                if (savedAttendance) {
+                    hasCheckedInToday = true;
+                    return;
+                }
+                
+                const response = await apiCall({ 
+                    action: 'getAttendanceHistory',
+                    studentId: registeredStudentId
+                });
+                
+                if (response.success && response.data && response.data.length > 0) {
+                    const today = new Date().toISOString().split('T')[0];
+                    const todayAttendance = response.data.filter(record => 
+                        record.timestamp.includes(today)
+                    );
+                    
+                    if (todayAttendance.length > 0) {
+                        hasCheckedInToday = true;
+                    }
+                }
+            } catch (error) {
+                console.error('Error checking today attendance:', error);
             }
         }
 
@@ -497,7 +582,7 @@
                                     <p class="text-sm text-gray-400">${timeString}</p>
                                 </div>
                                 <div class="bg-green-500 text-white text-xs px-2 py-1 rounded-full">
-                                    สำเร็จ
+                                    ${record.status || 'สำเร็จ'}
                                 </div>
                             </div>
                         `;
@@ -526,6 +611,12 @@
                 return;
             }
             
+            // ตรวจสอบว่ามีการเช็คชื่อวันนี้แล้วหรือไม่
+            if (hasCheckedInToday) {
+                showAlert('คุณได้เช็คชื่อวันนี้แล้ว ไม่สามารถเช็คชื่อซ้ำได้', 'info');
+                return;
+            }
+            
             isScanning = true;
             scanButton.innerHTML = '<div class="loader w-5 h-5 border-2 border-white border-t-transparent rounded-full"></div> กำลังสแกน...';
             scanButton.disabled = true;
@@ -540,11 +631,10 @@
                         .withFaceDescriptors();
                     
                     if (detections.length > 0) {
-                        // พบใบหน้า
-                        statusText.textContent = `พบใบหน้า ${detections.length} คน`;
+                        // พบใบหน้า - เรียกใช้การยืนยันตัวตนและเช็คชื่อ
+                        statusText.textContent = `พบใบหน้า ${detections.length} คน กำลังยืนยันตัวตน...`;
                         statusText.style.color = '#10b981';
                         
-                        // ตรวจสอบว่าเป็นใบหน้าของนักเรียนหรือไม่
                         await verifyAndCheckIn();
                     } else {
                         // ไม่พบใบหน้า
@@ -556,7 +646,7 @@
                     statusText.textContent = 'เกิดข้อผิดพลาดในการตรวจจับใบหน้า';
                     statusText.style.color = '#ef4444';
                 }
-            }, 1000);
+            }, 2000); // เปลี่ยนเป็นทุก 2 วินาทีเพื่อลดภาระการประมวลผล
         }
 
         function stopFaceDetection() {
@@ -569,6 +659,25 @@
             lucide.createIcons();
         }
 
+        // ฟังก์ชันกำหนดสถานะ
+        function determineStatus() {
+            const now = new Date();
+            const currentTime = now.getHours().toString().padStart(2, '0') + ':' + 
+                               now.getMinutes().toString().padStart(2, '0');
+            
+            // ใช้ค่าเริ่มต้นหรือดึงจาก localStorage
+            const lateTime = localStorage.getItem('lateTime') || '08:30';
+            const absentTime = localStorage.getItem('absentTime') || '12:00';
+            
+            if (currentTime > absentTime) {
+                return { status: 'ขาด', color: 'red' };
+            } else if (currentTime > lateTime) {
+                return { status: 'สาย', color: 'orange' };
+            } else {
+                return { status: 'มาโรงเรียน', color: 'green' };
+            }
+        }
+
         async function verifyAndCheckIn() {
             // ตรวจสอบว่ามีการเช็คชื่อไปแล้วในรอบ 5 วินาทีที่ผ่านมาหรือไม่
             const now = new Date();
@@ -579,32 +688,87 @@
             lastCheckinTime = now;
             
             try {
-                showAlert('กำลังตรวจสอบใบหน้าและบันทึกการเช็คชื่อ...', 'info');
+                // ตรวจจับและจดจำใบหน้า
+                const detections = await faceapi
+                    .detectAllFaces(video, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
+                    .withFaceLandmarks()
+                    .withFaceDescriptors();
                 
-                const response = await apiCall({
-                    action: 'checkIn',
-                    studentId: registeredStudentId,
-                    timestamp: now.toISOString()
-                });
+                if (detections.length === 0) {
+                    statusText.textContent = 'ไม่พบใบหน้า กรุณาอยู่ในกรอบ';
+                    statusText.style.color = '#fbbf24';
+                    return;
+                }
                 
-                if (response.success) {
-                    showAlert('เช็คชื่อสำเร็จ!', 'success');
-                    statusText.textContent = 'เช็คชื่อสำเร็จ!';
+                // ใช้ Face Recognition ตรวจสอบว่าเป็นนักเรียนที่ลงทะเบียนหรือไม่
+                let isRecognized = false;
+                
+                if (faceMatcher) {
+                    for (let detection of detections) {
+                        const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
+                        
+                        // ตรวจสอบว่าเป็นนักเรียนที่ลงทะเบียน (ใช้ชื่อในการจับคู่)
+                        if (bestMatch.label === registeredStudentName && bestMatch.distance < 0.6) {
+                            isRecognized = true;
+                            break;
+                        }
+                    }
+                }
+                
+                // ถ้าไม่ใช้ Face Recognition หรือไม่พบการจับคู่ ให้ใช้การตรวจจับใบหน้าแบบพื้นฐาน
+                if (!faceMatcher || !isRecognized) {
+                    isRecognized = detections.length > 0; // ตรวจจับใบหน้าได้ก็ให้ผ่าน
+                }
+                
+                if (isRecognized) {
+                    showAlert('กำลังตรวจสอบใบหน้าและบันทึกการเช็คชื่อ...', 'info');
+                    statusText.textContent = 'ตรวจสอบใบหน้าสำเร็จ! กำลังบันทึกข้อมูล...';
                     statusText.style.color = '#10b981';
                     
-                    // โหลดประวัติการเช็คชื่อใหม่
-                    await loadAttendanceHistory();
+                    // กำหนดสถานะ (มาโรงเรียน/สาย/ขาด)
+                    const statusInfo = determineStatus();
                     
-                    // หยุดการสแกนชั่วคราว
-                    setTimeout(() => {
-                        if (isScanning) {
-                            statusText.textContent = 'กำลังสแกนใบหน้า...';
-                            statusText.style.color = '#fbbf24';
-                        }
-                    }, 3000);
+                    const response = await apiCall({
+                        action: 'checkIn',
+                        studentId: registeredStudentId,
+                        studentName: registeredStudentName,
+                        studentClass: registeredStudentClass,
+                        timestamp: now.toISOString(),
+                        status: statusInfo.status
+                    });
+                    
+                    if (response.success) {
+                        showAlert('เช็คชื่อสำเร็จ! สถานะ: ' + statusInfo.status, 'success');
+                        statusText.textContent = 'เช็คชื่อสำเร็จ!';
+                        statusText.style.color = '#10b981';
+                        
+                        // บันทึกใน localStorage ว่ามีการเช็คชื่อวันนี้แล้ว
+                        const today = new Date().toDateString();
+                        localStorage.setItem(`attendance_${today}`, JSON.stringify({
+                            status: statusInfo.status,
+                            timestamp: now.toISOString()
+                        }));
+                        
+                        hasCheckedInToday = true;
+                        
+                        // โหลดประวัติการเช็คชื่อใหม่
+                        await loadAttendanceHistory();
+                        
+                        // หยุดการสแกน
+                        stopFaceDetection();
+                        
+                        // แสดงสถานะสำเร็จชั่วคราว
+                        setTimeout(() => {
+                            statusText.textContent = 'เช็คชื่อสำเร็จ!';
+                        }, 3000);
+                    } else {
+                        throw new Error(response.error || 'เกิดข้อผิดพลาดในการเช็คชื่อ');
+                    }
                 } else {
-                    throw new Error(response.error || 'เกิดข้อผิดพลาดในการเช็คชื่อ');
+                    statusText.textContent = 'ไม่สามารถยืนยันตัวตนได้ กรุณาลองอีกครั้ง';
+                    statusText.style.color = '#ef4444';
                 }
+                
             } catch (error) {
                 console.error('Check-in error:', error);
                 showAlert('เช็คชื่อไม่สำเร็จ: ' + error.message, 'error');
